@@ -99,6 +99,8 @@ struct deadline_data {
 	int front_merges;
 	u32 async_depth;
 
+	atomic_t inflight; /* the number of pending requests */
+
 	spinlock_t lock;
 	spinlock_t zone_lock;
 };
@@ -434,6 +436,8 @@ static struct request *__dd_dispatch_request(struct deadline_data *dd,
 		goto done;
 	}
 
+
+
 	/*
 	 * batches are currently reads XOR writes
 	 */
@@ -539,10 +543,17 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	enum dd_prio prio;
 
 	spin_lock(&dd->lock);
-	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
-		rq = __dd_dispatch_request(dd, &dd->per_prio[prio]);
+
+	if (atomic_read(&dd->inflight))
+	{
+		for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
+			rq = __dd_dispatch_request(dd, &dd->per_prio[prio]);
+			if (rq)
+				break;
+		}
+
 		if (rq)
-			break;
+			atomic_inc(&dd->inflight);
 	}
 	spin_unlock(&dd->lock);
 
@@ -646,6 +657,8 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
 	dd->fifo_batch = fifo_batch;
 	spin_lock_init(&dd->lock);
 	spin_lock_init(&dd->zone_lock);
+
+	atomic_set(&dd->inflight, 0); 
 
 	q->elevator = eq;
 	return 0;
@@ -833,7 +846,14 @@ static void dd_finish_request(struct request *rq)
 	 * blk_mq_request_bypass_insert().
 	 */
 	if (rq->elv.priv[0])
+	{
 		dd_count(dd, completed, prio);
+
+		if (atomic_dec_and_test(&dd->inflight))
+		{
+			blk_mq_sched_mark_restart_hctx(rq->mq_hctx);
+		}		
+	}
 
 	if (blk_queue_is_zoned(q)) {
 		unsigned long flags;
