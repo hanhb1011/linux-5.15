@@ -436,6 +436,8 @@ static struct request *__dd_dispatch_request(struct deadline_data *dd,
 		goto done;
 	}
 
+
+
 	/*
 	 * batches are currently reads XOR writes
 	 */
@@ -537,12 +539,12 @@ done:
 static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 {
 	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
-	struct request *rq = NULL;
+	struct request *rq;
 	enum dd_prio prio;
 
 	spin_lock(&dd->lock);
 
-	if (atomic_read(&dd->inflight) == 0)
+	if (atomic_read(&dd->inflight))
 	{
 		for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
 			rq = __dd_dispatch_request(dd, &dd->per_prio[prio]);
