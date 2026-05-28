@@ -64,6 +64,11 @@ struct io_stats {
 	struct io_stats_per_prio stats[DD_PRIO_COUNT];
 };
 
+struct dd_zns_zone_state {
+	unsigned int inflight;
+	bool disabled;
+};
+
 /*
  * Deadline scheduler data per I/O priority (enum dd_prio). Requests are
  * present on both sort_list[] and fifo_list[].
@@ -90,6 +95,10 @@ struct deadline_data {
 
 	struct io_stats __percpu *stats;
 
+	bool zns_multi_inflight_enabled;
+	unsigned int zns_nr_zones;
+	struct dd_zns_zone_state *zns_zones;
+
 	/*
 	 * settings that change how the i/o scheduler behaves
 	 */
@@ -102,6 +111,8 @@ struct deadline_data {
 	spinlock_t lock;
 	spinlock_t zone_lock;
 };
+
+#define DD_ZNS_MULTI_INFLIGHT	((void *)(uintptr_t)1)
 
 /* Count one event of type 'event_type' and with I/O priority 'prio' */
 #define dd_count(dd, event_type, prio) do {				\
@@ -151,6 +162,148 @@ deadline_rb_root(struct dd_per_prio *per_prio, struct request *rq)
 static u8 dd_rq_ioclass(struct request *rq)
 {
 	return IOPRIO_PRIO_CLASS(req_get_ioprio(rq));
+}
+
+static bool dd_zns_req_is_multi_inflight(struct request *rq)
+{
+	return rq->elv.priv[1] == DD_ZNS_MULTI_INFLIGHT;
+}
+
+static struct dd_zns_zone_state *
+dd_zns_get_zone(struct deadline_data *dd, struct request *rq)
+{
+#ifdef CONFIG_BLK_DEV_ZONED
+	unsigned int zno;
+
+	if (!dd->zns_zones)
+		return NULL;
+
+	zno = blk_rq_zone_no(rq);
+	if (zno >= dd->zns_nr_zones)
+		return NULL;
+
+	return &dd->zns_zones[zno];
+#else
+	(void)dd;
+	(void)rq;
+	return NULL;
+#endif
+}
+
+static bool
+dd_zns_req_is_multi_inflight_candidate(struct deadline_data *dd,
+				       struct request *rq)
+{
+	u8 ioprio_class = dd_rq_ioclass(rq);
+
+	if (!READ_ONCE(dd->zns_multi_inflight_enabled))
+		return false;
+	if (!blk_queue_is_zoned(rq->q))
+		return false;
+	if (req_op(rq) != REQ_OP_WRITE)
+		return false;
+	if (blk_rq_is_passthrough(rq))
+		return false;
+	if (rq->cmd_flags & (REQ_FUA | REQ_PREFLUSH))
+		return false;
+	if (ioprio_class != IOPRIO_CLASS_NONE &&
+	    ioprio_class != IOPRIO_CLASS_BE)
+		return false;
+	if (!blk_req_needs_zone_write_lock(rq))
+		return false;
+
+	return true;
+}
+
+/*
+ * Called while dd->zone_lock is held. This helper only decides whether a
+ * request may be dispatched; the caller starts either the ZNS multi-inflight path or
+ * the stock ZWL path immediately before returning the request to blk-mq.
+ */
+static bool dd_zns_can_dispatch(struct deadline_data *dd, struct request *rq,
+				bool allow_multi_inflight)
+{
+	struct dd_zns_zone_state *zs;
+
+	if (!blk_queue_is_zoned(rq->q))
+		return true;
+	if (!blk_req_needs_zone_write_lock(rq))
+		return true;
+
+	zs = dd_zns_get_zone(dd, rq);
+	if (!zs)
+		return blk_req_can_dispatch_to_zone(rq);
+
+	if (allow_multi_inflight &&
+	    dd_zns_req_is_multi_inflight_candidate(dd, rq) &&
+	    !zs->disabled) {
+		if (blk_req_zone_is_write_locked(rq))
+			return false;
+		return true;
+	}
+
+	if (zs->inflight > 0)
+		return false;
+
+	return blk_req_can_dispatch_to_zone(rq);
+}
+
+static bool
+dd_zns_try_start_multi_inflight(struct deadline_data *dd, struct request *rq,
+				bool allow_multi_inflight)
+{
+	struct dd_zns_zone_state *zs;
+
+	if (!allow_multi_inflight)
+		return false;
+	if (!dd_zns_req_is_multi_inflight_candidate(dd, rq))
+		return false;
+
+	zs = dd_zns_get_zone(dd, rq);
+	if (!zs)
+		return false;
+
+	if (zs->disabled)
+		return false;
+	if (blk_req_zone_is_write_locked(rq))
+		return false;
+
+	zs->inflight++;
+	rq->elv.priv[1] = DD_ZNS_MULTI_INFLIGHT;
+	return true;
+}
+
+/* Called while dd->zone_lock is held. */
+static void dd_zns_multi_inflight_finish(struct deadline_data *dd,
+					 struct request *rq)
+{
+	struct dd_zns_zone_state *zs;
+
+	if (!dd_zns_req_is_multi_inflight(rq))
+		return;
+
+	zs = dd_zns_get_zone(dd, rq);
+	if (WARN_ON_ONCE(!zs))
+		goto clear;
+	if (WARN_ON_ONCE(!zs->inflight))
+		goto clear;
+
+	zs->inflight--;
+
+clear:
+	rq->elv.priv[1] = NULL;
+}
+
+/* Called while dd->zone_lock is held. */
+static void dd_zns_disable_zone(struct deadline_data *dd, struct request *rq)
+{
+	struct dd_zns_zone_state *zs;
+
+	zs = dd_zns_get_zone(dd, rq);
+	if (!zs)
+		return;
+
+	zs->disabled = true;
 }
 
 /*
@@ -362,7 +515,7 @@ deadline_fifo_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
 	 */
 	spin_lock_irqsave(&dd->zone_lock, flags);
 	list_for_each_entry(rq, &per_prio->fifo_list[DD_WRITE], queuelist) {
-		if (blk_req_can_dispatch_to_zone(rq) &&
+		if (dd_zns_can_dispatch(dd, rq, true) &&
 		    (blk_queue_nonrot(rq->q) ||
 		     !deadline_is_seq_write(dd, rq)))
 			goto out;
@@ -401,7 +554,7 @@ deadline_next_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
 	 */
 	spin_lock_irqsave(&dd->zone_lock, flags);
 	while (rq) {
-		if (blk_req_can_dispatch_to_zone(rq))
+		if (dd_zns_can_dispatch(dd, rq, true))
 			break;
 		if (blk_queue_nonrot(rq->q))
 			rq = deadline_latter_request(rq);
@@ -424,13 +577,25 @@ static struct request *__dd_dispatch_request(struct deadline_data *dd,
 	enum dd_data_dir data_dir;
 	enum dd_prio prio;
 	u8 ioprio_class;
+	bool from_dispatch_list;
 
 	lockdep_assert_held(&dd->lock);
 
 	if (!list_empty(&per_prio->dispatch)) {
+		unsigned long flags;
+
 		rq = list_first_entry(&per_prio->dispatch, struct request,
 				      queuelist);
+
+		spin_lock_irqsave(&dd->zone_lock, flags);
+		if (!dd_zns_can_dispatch(dd, rq, false)) {
+			spin_unlock_irqrestore(&dd->zone_lock, flags);
+			return NULL;
+		}
+		spin_unlock_irqrestore(&dd->zone_lock, flags);
+
 		list_del_init(&rq->queuelist);
+		from_dispatch_list = true;
 		goto done;
 	}
 
@@ -512,6 +677,7 @@ dispatch_request:
 	 */
 	dd->batching++;
 	deadline_move_request(dd, per_prio, rq);
+	from_dispatch_list = false;
 done:
 	ioprio_class = dd_rq_ioclass(rq);
 	prio = ioprio_class_to_prio[ioprio_class];
@@ -519,7 +685,17 @@ done:
 	/*
 	 * If the request needs its target zone locked, do it.
 	 */
-	blk_req_zone_write_lock(rq);
+	if (blk_queue_is_zoned(rq->q)) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&dd->zone_lock, flags);
+		if (!dd_zns_try_start_multi_inflight(dd, rq,
+						     !from_dispatch_list))
+			blk_req_zone_write_lock(rq);
+		spin_unlock_irqrestore(&dd->zone_lock, flags);
+	} else {
+		blk_req_zone_write_lock(rq);
+	}
 	rq->rq_flags |= RQF_STARTED;
 	return rq;
 }
@@ -600,6 +776,7 @@ static void dd_exit_sched(struct elevator_queue *e)
 	}
 
 	free_percpu(dd->stats);
+	kfree(dd->zns_zones);
 
 	kfree(dd);
 }
@@ -646,6 +823,16 @@ static int dd_init_sched(struct request_queue *q, struct elevator_type *e)
 	dd->fifo_batch = fifo_batch;
 	spin_lock_init(&dd->lock);
 	spin_lock_init(&dd->zone_lock);
+
+#ifdef CONFIG_BLK_DEV_ZONED
+	dd->zns_multi_inflight_enabled = false;
+	if (blk_queue_is_zoned(q) && q->nr_zones > 0) {
+		dd->zns_zones = kcalloc(q->nr_zones, sizeof(*dd->zns_zones),
+					GFP_KERNEL);
+		if (dd->zns_zones)
+			dd->zns_nr_zones = q->nr_zones;
+	}
+#endif
 
 	q->elevator = eq;
 	return 0;
@@ -732,7 +919,19 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 	 * This may be a requeue of a write request that has locked its
 	 * target zone. If it is the case, this releases the zone lock.
 	 */
-	blk_req_zone_write_unlock(rq);
+	if (blk_queue_is_zoned(q)) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&dd->zone_lock, flags);
+		if (dd_zns_req_is_multi_inflight(rq)) {
+			dd_zns_multi_inflight_finish(dd, rq);
+			dd_zns_disable_zone(dd, rq);
+		}
+		blk_req_zone_write_unlock(rq);
+		spin_unlock_irqrestore(&dd->zone_lock, flags);
+	} else {
+		blk_req_zone_write_unlock(rq);
+	}
 
 	prio = ioprio_class_to_prio[ioprio_class];
 	dd_count(dd, inserted, prio);
@@ -789,6 +988,7 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 static void dd_prepare_request(struct request *rq)
 {
 	rq->elv.priv[0] = NULL;
+	rq->elv.priv[1] = NULL;
 }
 
 static bool dd_has_write_work(struct blk_mq_hw_ctx *hctx)
@@ -839,7 +1039,10 @@ static void dd_finish_request(struct request *rq)
 		unsigned long flags;
 
 		spin_lock_irqsave(&dd->zone_lock, flags);
-		blk_req_zone_write_unlock(rq);
+		if (dd_zns_req_is_multi_inflight(rq))
+			dd_zns_multi_inflight_finish(dd, rq);
+		else
+			blk_req_zone_write_unlock(rq);
 		spin_unlock_irqrestore(&dd->zone_lock, flags);
 
 		if (dd_has_write_work(rq->mq_hctx))
@@ -886,6 +1089,15 @@ SHOW_INT(deadline_fifo_batch_show, dd->fifo_batch);
 #undef SHOW_INT
 #undef SHOW_JIFFIES
 
+static ssize_t deadline_zns_multi_inflight_show(struct elevator_queue *e,
+						char *page)
+{
+	struct deadline_data *dd = e->elevator_data;
+
+	return sysfs_emit(page, "%u\n",
+			  READ_ONCE(dd->zns_multi_inflight_enabled) ? 1 : 0);
+}
+
 #define STORE_FUNCTION(__FUNC, __PTR, MIN, MAX, __CONV)			\
 static ssize_t __FUNC(struct elevator_queue *e, const char *page, size_t count)	\
 {									\
@@ -916,6 +1128,29 @@ STORE_INT(deadline_fifo_batch_store, &dd->fifo_batch, 0, INT_MAX);
 #undef STORE_INT
 #undef STORE_JIFFIES
 
+static ssize_t deadline_zns_multi_inflight_store(struct elevator_queue *e,
+						 const char *page,
+						 size_t count)
+{
+	struct deadline_data *dd = e->elevator_data;
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(page, 0, &val);
+	if (ret)
+		return ret;
+	if (val > 1)
+		return -EINVAL;
+	if (val && !dd->zns_zones)
+		return -EINVAL;
+
+	spin_lock(&dd->lock);
+	WRITE_ONCE(dd->zns_multi_inflight_enabled, !!val);
+	spin_unlock(&dd->lock);
+
+	return count;
+}
+
 #define DD_ATTR(name) \
 	__ATTR(name, 0644, deadline_##name##_show, deadline_##name##_store)
 
@@ -926,6 +1161,7 @@ static struct elv_fs_entry deadline_attrs[] = {
 	DD_ATTR(front_merges),
 	DD_ATTR(async_depth),
 	DD_ATTR(fifo_batch),
+	DD_ATTR(zns_multi_inflight),
 	__ATTR_NULL
 };
 
