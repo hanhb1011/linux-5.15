@@ -247,6 +247,25 @@ dd_zns_log_multi_inflight_result(struct deadline_data *dd, struct request *rq,
 			    blk_rq_sectors(rq));
 }
 
+static void
+dd_zns_log_zone_write_lock(struct deadline_data *dd, struct request *rq,
+			   struct dd_zns_zone_state *zs,
+			   bool from_dispatch_list, bool needs_zlock,
+			   bool wlocked_before)
+{
+	if (!READ_ONCE(dd->zns_multi_inflight_debug))
+		return;
+
+	pr_info_ratelimited("mq-deadline: zns_zone_write_lock dev=%s op=%u cmd_flags=0x%x zone=%u from_dispatch_list=%u needs_zlock=%u disabled=%d inflight=%u wlocked_before=%u wlocked_after=%u pos=%llu sectors=%u\n",
+			    rq->rq_disk ? rq->rq_disk->disk_name : "?",
+			    req_op(rq), rq->cmd_flags, dd_zns_debug_zone_no(rq),
+			    from_dispatch_list, needs_zlock,
+			    zs ? zs->disabled : -1, zs ? zs->inflight : 0,
+			    wlocked_before, blk_req_zone_is_write_locked(rq),
+			    (unsigned long long)blk_rq_pos(rq),
+			    blk_rq_sectors(rq));
+}
+
 static struct dd_zns_zone_state *
 dd_zns_get_zone(struct deadline_data *dd, struct request *rq)
 {
@@ -266,6 +285,20 @@ dd_zns_get_zone(struct deadline_data *dd, struct request *rq)
 	(void)rq;
 	return NULL;
 #endif
+}
+
+/* Called while dd->zone_lock is held. */
+static void dd_zns_fallback_zone_write_lock(struct deadline_data *dd,
+					    struct request *rq,
+					    bool from_dispatch_list)
+{
+	struct dd_zns_zone_state *zs = dd_zns_get_zone(dd, rq);
+	bool needs_zlock = blk_req_needs_zone_write_lock(rq);
+	bool wlocked_before = blk_req_zone_is_write_locked(rq);
+
+	blk_req_zone_write_lock(rq);
+	dd_zns_log_zone_write_lock(dd, rq, zs, from_dispatch_list,
+				   needs_zlock, wlocked_before);
 }
 
 static enum dd_zns_multi_inflight_result
@@ -799,7 +832,8 @@ done:
 		spin_lock_irqsave(&dd->zone_lock, flags);
 		if (!dd_zns_try_start_multi_inflight(dd, rq,
 						     from_dispatch_list))
-			blk_req_zone_write_lock(rq);
+			dd_zns_fallback_zone_write_lock(dd, rq,
+							from_dispatch_list);
 		spin_unlock_irqrestore(&dd->zone_lock, flags);
 	} else {
 		blk_req_zone_write_lock(rq);
