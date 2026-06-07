@@ -238,37 +238,11 @@ static unsigned int dd_zns_debug_ctx_cpu(struct request *rq)
 }
 
 static void
-dd_zns_log_multi_inflight_result(struct deadline_data *dd, struct request *rq,
-				 struct dd_zns_zone_state *zs,
-				 bool from_dispatch_list,
-				 enum dd_zns_multi_inflight_result result)
-{
-	if (!READ_ONCE(dd->zns_multi_inflight_debug))
-		return;
-	if (result == DD_ZNS_MULTI_INFLIGHT_NO_ZWL)
-		return;
-	if (result == DD_ZNS_MULTI_INFLIGHT_NOT_WRITE &&
-	    !blk_req_needs_zone_write_lock(rq))
-		return;
-
-	pr_info_ratelimited("mq-deadline: zns_multi_inflight skip reason=%s dev=%s op=%u cmd_flags=0x%x zone=%u hctx=%u ctx_cpu=%u tag=%d internal_tag=%d from_dispatch_list=%u disabled=%d wlocked=%u inflight=%u pos=%llu sectors=%u\n",
-			    dd_zns_multi_inflight_result_name(result),
-			    rq->rq_disk ? rq->rq_disk->disk_name : "?",
-			    req_op(rq), rq->cmd_flags, dd_zns_debug_zone_no(rq),
-			    dd_zns_debug_hctx(rq), dd_zns_debug_ctx_cpu(rq),
-			    rq->tag, rq->internal_tag, from_dispatch_list,
-			    zs ? zs->disabled : -1,
-			    blk_req_zone_is_write_locked(rq),
-			    zs ? zs->inflight : 0,
-			    (unsigned long long)blk_rq_pos(rq),
-			    blk_rq_sectors(rq));
-}
-
-static void
 dd_zns_log_zone_write_lock(struct deadline_data *dd, struct request *rq,
 			   struct dd_zns_zone_state *zs,
 			   bool from_dispatch_list, bool needs_zlock,
-			   bool wlocked_before)
+			   bool wlocked_before,
+			   enum dd_zns_multi_inflight_result reason)
 {
 	bool wlocked_after;
 
@@ -276,57 +250,17 @@ dd_zns_log_zone_write_lock(struct deadline_data *dd, struct request *rq,
 		return;
 
 	wlocked_after = blk_req_zone_is_write_locked(rq);
-	if (!needs_zlock && !wlocked_before && !wlocked_after)
+	if (!needs_zlock || wlocked_before || !wlocked_after)
 		return;
 
-	pr_info_ratelimited("mq-deadline: zns_zone_write_lock dev=%s op=%u cmd_flags=0x%x zone=%u hctx=%u ctx_cpu=%u tag=%d internal_tag=%d from_dispatch_list=%u needs_zlock=%u disabled=%d inflight=%u wlocked_before=%u wlocked_after=%u pos=%llu sectors=%u\n",
-			    rq->rq_disk ? rq->rq_disk->disk_name : "?",
-			    req_op(rq), rq->cmd_flags, dd_zns_debug_zone_no(rq),
-			    dd_zns_debug_hctx(rq), dd_zns_debug_ctx_cpu(rq),
-			    rq->tag, rq->internal_tag, from_dispatch_list,
-			    needs_zlock, zs ? zs->disabled : -1,
-			    zs ? zs->inflight : 0,
-			    wlocked_before, wlocked_after,
-			    (unsigned long long)blk_rq_pos(rq),
-			    blk_rq_sectors(rq));
-}
-
-static void
-dd_zns_log_multi_inflight_start(struct deadline_data *dd, struct request *rq,
-				struct dd_zns_zone_state *zs,
-				unsigned int inflight_before)
-{
-	if (!READ_ONCE(dd->zns_multi_inflight_debug))
-		return;
-
-	pr_info_ratelimited("mq-deadline: zns_multi_inflight start dev=%s op=%u cmd_flags=0x%x zone=%u hctx=%u ctx_cpu=%u tag=%d internal_tag=%d disabled=%d inflight_before=%u inflight_after=%u wlocked=%u pos=%llu sectors=%u\n",
-			    rq->rq_disk ? rq->rq_disk->disk_name : "?",
-			    req_op(rq), rq->cmd_flags, dd_zns_debug_zone_no(rq),
-			    dd_zns_debug_hctx(rq), dd_zns_debug_ctx_cpu(rq),
-			    rq->tag, rq->internal_tag, zs->disabled,
-			    inflight_before, zs->inflight,
-			    blk_req_zone_is_write_locked(rq),
-			    (unsigned long long)blk_rq_pos(rq),
-			    blk_rq_sectors(rq));
-}
-
-static void
-dd_zns_log_multi_inflight_finish(struct deadline_data *dd, struct request *rq,
-				 struct dd_zns_zone_state *zs,
-				 unsigned int inflight_before)
-{
-	if (!READ_ONCE(dd->zns_multi_inflight_debug))
-		return;
-
-	pr_info_ratelimited("mq-deadline: zns_multi_inflight finish dev=%s op=%u cmd_flags=0x%x zone=%u hctx=%u ctx_cpu=%u tag=%d internal_tag=%d disabled=%d inflight_before=%u inflight_after=%u wlocked=%u pos=%llu sectors=%u\n",
-			    rq->rq_disk ? rq->rq_disk->disk_name : "?",
-			    req_op(rq), rq->cmd_flags, dd_zns_debug_zone_no(rq),
-			    dd_zns_debug_hctx(rq), dd_zns_debug_ctx_cpu(rq),
-			    rq->tag, rq->internal_tag, zs ? zs->disabled : -1,
-			    inflight_before, zs ? zs->inflight : 0,
-			    blk_req_zone_is_write_locked(rq),
-			    (unsigned long long)blk_rq_pos(rq),
-			    blk_rq_sectors(rq));
+	pr_info("mq-deadline: zns_zone_write_lock lock_owner=mq-deadline fallback_reason=%s dev=%s op=%u cmd_flags=0x%x zone=%u hctx=%u ctx_cpu=%u tag=%d internal_tag=%d from_dispatch_list=%u disabled=%d inflight=%u pos=%llu sectors=%u\n",
+		dd_zns_multi_inflight_result_name(reason),
+		rq->rq_disk ? rq->rq_disk->disk_name : "?",
+		req_op(rq), rq->cmd_flags, dd_zns_debug_zone_no(rq),
+		dd_zns_debug_hctx(rq), dd_zns_debug_ctx_cpu(rq),
+		rq->tag, rq->internal_tag, from_dispatch_list,
+		zs ? zs->disabled : -1, zs ? zs->inflight : 0,
+		(unsigned long long)blk_rq_pos(rq), blk_rq_sectors(rq));
 }
 
 static void
@@ -336,14 +270,13 @@ dd_zns_log_multi_inflight_disable(struct deadline_data *dd, struct request *rq,
 	if (!READ_ONCE(dd->zns_multi_inflight_debug))
 		return;
 
-	pr_info_ratelimited("mq-deadline: zns_multi_inflight disable dev=%s op=%u cmd_flags=0x%x zone=%u hctx=%u ctx_cpu=%u tag=%d internal_tag=%d inflight=%u wlocked=%u pos=%llu sectors=%u\n",
-			    rq->rq_disk ? rq->rq_disk->disk_name : "?",
-			    req_op(rq), rq->cmd_flags, dd_zns_debug_zone_no(rq),
-			    dd_zns_debug_hctx(rq), dd_zns_debug_ctx_cpu(rq),
-			    rq->tag, rq->internal_tag, zs ? zs->inflight : 0,
-			    blk_req_zone_is_write_locked(rq),
-			    (unsigned long long)blk_rq_pos(rq),
-			    blk_rq_sectors(rq));
+	pr_info("mq-deadline: zns_multi_inflight disable dev=%s op=%u cmd_flags=0x%x zone=%u hctx=%u ctx_cpu=%u tag=%d internal_tag=%d inflight=%u wlocked=%u pos=%llu sectors=%u\n",
+		rq->rq_disk ? rq->rq_disk->disk_name : "?",
+		req_op(rq), rq->cmd_flags, dd_zns_debug_zone_no(rq),
+		dd_zns_debug_hctx(rq), dd_zns_debug_ctx_cpu(rq),
+		rq->tag, rq->internal_tag, zs ? zs->inflight : 0,
+		blk_req_zone_is_write_locked(rq),
+		(unsigned long long)blk_rq_pos(rq), blk_rq_sectors(rq));
 }
 
 static struct dd_zns_zone_state *
@@ -370,7 +303,8 @@ dd_zns_get_zone(struct deadline_data *dd, struct request *rq)
 /* Called while dd->zone_lock is held. */
 static void dd_zns_fallback_zone_write_lock(struct deadline_data *dd,
 					    struct request *rq,
-					    bool from_dispatch_list)
+					    bool from_dispatch_list,
+					    enum dd_zns_multi_inflight_result reason)
 {
 	struct dd_zns_zone_state *zs = dd_zns_get_zone(dd, rq);
 	bool needs_zlock = blk_req_needs_zone_write_lock(rq);
@@ -378,7 +312,7 @@ static void dd_zns_fallback_zone_write_lock(struct deadline_data *dd,
 
 	blk_req_zone_write_lock(rq);
 	dd_zns_log_zone_write_lock(dd, rq, zs, from_dispatch_list,
-				   needs_zlock, wlocked_before);
+				   needs_zlock, wlocked_before, reason);
 }
 
 static enum dd_zns_multi_inflight_result
@@ -449,51 +383,41 @@ static bool dd_zns_can_dispatch(struct deadline_data *dd, struct request *rq,
 
 static bool
 dd_zns_try_start_multi_inflight(struct deadline_data *dd, struct request *rq,
-				bool from_dispatch_list)
+				bool from_dispatch_list,
+				enum dd_zns_multi_inflight_result *reason)
 {
 	enum dd_zns_multi_inflight_result result;
 	struct dd_zns_zone_state *zs;
-	unsigned int inflight_before;
 
 	if (from_dispatch_list) {
-		dd_zns_log_multi_inflight_result(dd, rq, NULL,
-						 from_dispatch_list,
-						 DD_ZNS_MULTI_INFLIGHT_FROM_DISPATCH_LIST);
+		*reason = DD_ZNS_MULTI_INFLIGHT_FROM_DISPATCH_LIST;
 		return false;
 	}
 
 	result = dd_zns_req_multi_inflight_candidate_result(dd, rq);
 	if (result != DD_ZNS_MULTI_INFLIGHT_OK) {
-		dd_zns_log_multi_inflight_result(dd, rq, NULL,
-						 from_dispatch_list, result);
+		*reason = result;
 		return false;
 	}
 
 	zs = dd_zns_get_zone(dd, rq);
 	if (!zs) {
-		dd_zns_log_multi_inflight_result(dd, rq, NULL,
-						 from_dispatch_list,
-						 DD_ZNS_MULTI_INFLIGHT_NO_ZONE_STATE);
+		*reason = DD_ZNS_MULTI_INFLIGHT_NO_ZONE_STATE;
 		return false;
 	}
 
 	if (zs->disabled) {
-		dd_zns_log_multi_inflight_result(dd, rq, zs,
-						 from_dispatch_list,
-						 DD_ZNS_MULTI_INFLIGHT_ZONE_DISABLED);
+		*reason = DD_ZNS_MULTI_INFLIGHT_ZONE_DISABLED;
 		return false;
 	}
 	if (blk_req_zone_is_write_locked(rq)) {
-		dd_zns_log_multi_inflight_result(dd, rq, zs,
-						 from_dispatch_list,
-						 DD_ZNS_MULTI_INFLIGHT_ZONE_WLOCKED);
+		*reason = DD_ZNS_MULTI_INFLIGHT_ZONE_WLOCKED;
 		return false;
 	}
 
-	inflight_before = zs->inflight;
 	zs->inflight++;
 	rq->elv.priv[1] = DD_ZNS_MULTI_INFLIGHT;
-	dd_zns_log_multi_inflight_start(dd, rq, zs, inflight_before);
+	*reason = DD_ZNS_MULTI_INFLIGHT_OK;
 	return true;
 }
 
@@ -502,7 +426,6 @@ static void dd_zns_multi_inflight_finish(struct deadline_data *dd,
 					 struct request *rq)
 {
 	struct dd_zns_zone_state *zs;
-	unsigned int inflight_before = 0;
 
 	if (!dd_zns_req_is_multi_inflight(rq))
 		return;
@@ -513,9 +436,7 @@ static void dd_zns_multi_inflight_finish(struct deadline_data *dd,
 	if (WARN_ON_ONCE(!zs->inflight))
 		goto clear;
 
-	inflight_before = zs->inflight;
 	zs->inflight--;
-	dd_zns_log_multi_inflight_finish(dd, rq, zs, inflight_before);
 
 clear:
 	rq->elv.priv[1] = NULL;
@@ -804,6 +725,7 @@ static struct request *__dd_dispatch_request(struct deadline_data *dd,
 	struct request *rq, *next_rq;
 	enum dd_data_dir data_dir;
 	enum dd_prio prio;
+	enum dd_zns_multi_inflight_result zns_result = DD_ZNS_MULTI_INFLIGHT_OK;
 	u8 ioprio_class;
 	bool from_dispatch_list;
 
@@ -918,9 +840,11 @@ done:
 
 		spin_lock_irqsave(&dd->zone_lock, flags);
 		if (!dd_zns_try_start_multi_inflight(dd, rq,
-						     from_dispatch_list))
+						     from_dispatch_list,
+						     &zns_result))
 			dd_zns_fallback_zone_write_lock(dd, rq,
-							from_dispatch_list);
+							from_dispatch_list,
+							zns_result);
 		spin_unlock_irqrestore(&dd->zone_lock, flags);
 	} else {
 		blk_req_zone_write_lock(rq);
