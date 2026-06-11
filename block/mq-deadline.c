@@ -250,16 +250,18 @@ dd_zns_log_zone_write_lock(struct deadline_data *dd, struct request *rq,
 		return;
 
 	wlocked_after = blk_req_zone_is_write_locked(rq);
-	if (!needs_zlock || wlocked_before || !wlocked_after)
+	if (!needs_zlock)
 		return;
 
-	pr_info("mq-deadline: zns_zone_write_lock lock_owner=mq-deadline fallback_reason=%s dev=%s op=%u cmd_flags=0x%x zone=%u hctx=%u ctx_cpu=%u tag=%d internal_tag=%d from_dispatch_list=%u disabled=%d inflight=%u pos=%llu sectors=%u\n",
+	pr_info("mq-deadline: zns_zone_write_lock lock_owner=mq-deadline fallback_reason=%s lock_set=%u dev=%s op=%u cmd_flags=0x%x zone=%u hctx=%u ctx_cpu=%u tag=%d internal_tag=%d from_dispatch_list=%u disabled=%d inflight=%u wlocked_before=%u wlocked_after=%u pos=%llu sectors=%u\n",
 		dd_zns_multi_inflight_result_name(reason),
+		!wlocked_before && wlocked_after,
 		rq->rq_disk ? rq->rq_disk->disk_name : "?",
 		req_op(rq), rq->cmd_flags, dd_zns_debug_zone_no(rq),
 		dd_zns_debug_hctx(rq), dd_zns_debug_ctx_cpu(rq),
 		rq->tag, rq->internal_tag, from_dispatch_list,
 		zs ? zs->disabled : -1, zs ? zs->inflight : 0,
+		wlocked_before, wlocked_after,
 		(unsigned long long)blk_rq_pos(rq), blk_rq_sectors(rq));
 }
 
