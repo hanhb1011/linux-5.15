@@ -156,6 +156,9 @@ struct blk_mq_alloc_data {
 	blk_mq_req_flags_t flags;
 	unsigned int shallow_depth;
 	unsigned int cmd_flags;
+	bool zns_per_zone_mapping_candidate;
+	unsigned int zns_per_zone_mapping_hctx_idx;
+	unsigned int zns_per_zone_mapping_zone_no;
 
 	/* input & output parameter */
 	struct blk_mq_ctx *ctx;

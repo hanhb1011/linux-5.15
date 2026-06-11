@@ -43,6 +43,11 @@
 
 static DEFINE_PER_CPU(struct llist_head, blk_cpu_done);
 
+static bool zns_per_zone_mapping;
+module_param_named(zns_per_zone_mapping, zns_per_zone_mapping, bool, 0644);
+MODULE_PARM_DESC(zns_per_zone_mapping,
+		 "Experimental: enable per-zone hctx mapping for regular ZNS writes");
+
 static void blk_mq_poll_stats_start(struct request_queue *q);
 static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
 
@@ -352,6 +357,68 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
 	return rq;
 }
 
+static bool blk_mq_zns_per_zone_mapping_candidate(struct request_queue *q,
+						  struct bio *bio,
+						  unsigned int *zone_no,
+						  unsigned int *hctx_idx)
+{
+#ifdef CONFIG_BLK_DEV_ZONED
+	struct blk_mq_queue_map *map;
+	struct elevator_queue *e = q->elevator;
+	unsigned int zone_sectors = blk_queue_zone_sectors(q);
+	sector_t zno;
+	unsigned int hctx;
+
+	if (!zns_per_zone_mapping)
+		return false;
+	if (!blk_queue_is_zoned(q))
+		return false;
+	if (!e || strcmp(e->type->elevator_name, "mq-deadline"))
+		return false;
+	if (bio_op(bio) != REQ_OP_WRITE)
+		return false;
+	zno = bio->bi_iter.bi_sector >> ilog2(zone_sectors);
+
+	map = &q->tag_set->map[HCTX_TYPE_DEFAULT];
+	if (!map->nr_queues)
+		return false;
+
+	/* Map within the default hctx set, not across all hardware queues. */
+	hctx = map->queue_offset + (zno % map->nr_queues);
+	if (hctx >= q->nr_hw_queues)
+		return false;
+
+	*zone_no = zno;
+	*hctx_idx = hctx;
+	return true;
+#else
+	return false;
+#endif
+}
+
+static bool blk_mq_zns_apply_per_zone_mapping(struct blk_mq_alloc_data *data)
+{
+	struct request_queue *q = data->q;
+	unsigned int cpu;
+
+	if (!data->zns_per_zone_mapping_candidate)
+		return false;
+
+	data->hctx = q->queue_hw_ctx[data->zns_per_zone_mapping_hctx_idx];
+	if (!blk_mq_hw_queue_mapped(data->hctx))
+		return false;
+
+	cpu = cpumask_first_and(data->hctx->cpumask, cpu_online_mask);
+	if (cpu >= nr_cpu_ids)
+		return false;
+
+	data->ctx = __blk_mq_get_ctx(q, cpu);
+	if (data->ctx->hctxs[HCTX_TYPE_DEFAULT] != data->hctx)
+		return false;
+
+	return true;
+}
+
 static struct request *__blk_mq_alloc_request(struct blk_mq_alloc_data *data)
 {
 	struct request_queue *q = data->q;
@@ -380,8 +447,10 @@ static struct request *__blk_mq_alloc_request(struct blk_mq_alloc_data *data)
 	}
 
 retry:
-	data->ctx = blk_mq_get_ctx(q);
-	data->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);
+	if (!blk_mq_zns_apply_per_zone_mapping(data)) {
+		data->ctx = blk_mq_get_ctx(q);
+		data->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);
+	}
 	if (!e)
 		blk_mq_tag_busy(data->hctx);
 
@@ -2209,7 +2278,9 @@ blk_qc_t blk_mq_submit_bio(struct bio *bio)
 	struct request *rq;
 	struct blk_plug *plug;
 	struct request *same_queue_rq = NULL;
+	unsigned int hctx_idx;
 	unsigned int nr_segs;
+	unsigned int zno;
 	blk_qc_t cookie;
 	blk_status_t ret;
 	bool hipri;
@@ -2234,6 +2305,12 @@ blk_qc_t blk_mq_submit_bio(struct bio *bio)
 	hipri = bio->bi_opf & REQ_HIPRI;
 
 	data.cmd_flags = bio->bi_opf;
+	if (blk_mq_zns_per_zone_mapping_candidate(q, bio, &zno, &hctx_idx)) {
+		data.zns_per_zone_mapping_candidate = true;
+		data.zns_per_zone_mapping_hctx_idx = hctx_idx;
+		data.zns_per_zone_mapping_zone_no = zno;
+	}
+
 	rq = __blk_mq_alloc_request(&data);
 	if (unlikely(!rq)) {
 		rq_qos_cleanup(q, bio);
