@@ -48,6 +48,12 @@ module_param_named(zns_per_zone_mapping, zns_per_zone_mapping, bool, 0644);
 MODULE_PARM_DESC(zns_per_zone_mapping,
 		 "Experimental: enable per-zone hctx mapping for regular ZNS writes");
 
+static bool zns_per_zone_mapping_debug;
+module_param_named(zns_per_zone_mapping_debug, zns_per_zone_mapping_debug,
+		   bool, 0644);
+MODULE_PARM_DESC(zns_per_zone_mapping_debug,
+		 "Trace ZNS per-zone hctx mapping fallbacks (default: false)");
+
 static void blk_mq_poll_stats_start(struct request_queue *q);
 static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
 
@@ -366,6 +372,7 @@ static bool blk_mq_zns_per_zone_mapping_candidate(struct request_queue *q,
 	struct blk_mq_queue_map *map;
 	struct elevator_queue *e = q->elevator;
 	unsigned int zone_sectors = blk_queue_zone_sectors(q);
+	const char *reason;
 	sector_t zno;
 	unsigned int hctx;
 
@@ -373,24 +380,37 @@ static bool blk_mq_zns_per_zone_mapping_candidate(struct request_queue *q,
 		return false;
 	if (!blk_queue_is_zoned(q))
 		return false;
-	if (!e || strcmp(e->type->elevator_name, "mq-deadline"))
-		return false;
+	if (!e || strcmp(e->type->elevator_name, "mq-deadline")) {
+		reason = "elevator";
+		goto fallback;
+	}
 	if (bio_op(bio) != REQ_OP_WRITE)
 		return false;
 	zno = bio->bi_iter.bi_sector >> ilog2(zone_sectors);
 
 	map = &q->tag_set->map[HCTX_TYPE_DEFAULT];
-	if (!map->nr_queues)
-		return false;
+	if (!map->nr_queues) {
+		reason = "nr_queues";
+		goto fallback;
+	}
 
 	/* Map within the default hctx set, not across all hardware queues. */
 	hctx = map->queue_offset + (zno % map->nr_queues);
-	if (hctx >= q->nr_hw_queues)
-		return false;
+	if (hctx >= q->nr_hw_queues) {
+		reason = "hctx_bound";
+		goto fallback;
+	}
 
 	*zone_no = zno;
 	*hctx_idx = hctx;
 	return true;
+
+fallback:
+	if (zns_per_zone_mapping_debug && bio_op(bio) == REQ_OP_WRITE)
+		trace_printk("zns_map candidate_fallback reason=%s sector=%llu\n",
+			     reason,
+			     (unsigned long long)bio->bi_iter.bi_sector);
+	return false;
 #else
 	return false;
 #endif
@@ -399,24 +419,38 @@ static bool blk_mq_zns_per_zone_mapping_candidate(struct request_queue *q,
 static bool blk_mq_zns_apply_per_zone_mapping(struct blk_mq_alloc_data *data)
 {
 	struct request_queue *q = data->q;
+	const char *reason;
 	unsigned int cpu;
 
 	if (!data->zns_per_zone_mapping_candidate)
 		return false;
 
 	data->hctx = q->queue_hw_ctx[data->zns_per_zone_mapping_hctx_idx];
-	if (!blk_mq_hw_queue_mapped(data->hctx))
-		return false;
+	if (!blk_mq_hw_queue_mapped(data->hctx)) {
+		reason = "unmapped_hctx";
+		goto fallback;
+	}
 
 	cpu = cpumask_first_and(data->hctx->cpumask, cpu_online_mask);
-	if (cpu >= nr_cpu_ids)
-		return false;
+	if (cpu >= nr_cpu_ids) {
+		reason = "no_online_cpu";
+		goto fallback;
+	}
 
 	data->ctx = __blk_mq_get_ctx(q, cpu);
-	if (data->ctx->hctxs[HCTX_TYPE_DEFAULT] != data->hctx)
-		return false;
+	if (data->ctx->hctxs[HCTX_TYPE_DEFAULT] != data->hctx) {
+		reason = "ctx_mismatch";
+		goto fallback;
+	}
 
 	return true;
+
+fallback:
+	if (zns_per_zone_mapping_debug)
+		trace_printk("zns_map apply_fallback reason=%s zone=%u hctx_idx=%u\n",
+			     reason, data->zns_per_zone_mapping_zone_no,
+			     data->zns_per_zone_mapping_hctx_idx);
+	return false;
 }
 
 static struct request *__blk_mq_alloc_request(struct blk_mq_alloc_data *data)

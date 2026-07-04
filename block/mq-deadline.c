@@ -99,6 +99,7 @@ struct deadline_data {
 	bool zns_multi_inflight_debug;
 	unsigned int zns_nr_zones;
 	struct dd_zns_zone_state *zns_zones;
+	u64 zns_debug_dispatch_seq;
 
 	/*
 	 * settings that change how the i/o scheduler behaves
@@ -235,6 +236,34 @@ static unsigned int dd_zns_debug_hctx(struct request *rq)
 static unsigned int dd_zns_debug_ctx_cpu(struct request *rq)
 {
 	return rq->mq_ctx ? rq->mq_ctx->cpu : UINT_MAX;
+}
+
+/*
+ * Temporary instrumentation for the dispatch-order experiment. Called with
+ * dd->lock held, so zns_debug_dispatch_seq totally orders every scheduler
+ * dispatch of this queue. call_hctx is the hw queue this dispatch was pulled
+ * for and may differ from rq->mq_hctx (mq-deadline state is queue-global).
+ */
+static void dd_zns_debug_log_dispatch(struct deadline_data *dd,
+				      struct request *rq,
+				      struct blk_mq_hw_ctx *call_hctx,
+				      bool from_dispatch_list)
+{
+	if (!READ_ONCE(dd->zns_multi_inflight_debug))
+		return;
+	if (!blk_queue_is_zoned(rq->q) || req_op(rq) != REQ_OP_WRITE)
+		return;
+
+	trace_printk("dd_dispatch seq=%llu zone=%u pos=%llu sectors=%u rq_hctx=%u call_hctx=%u multi=%d fdl=%d itag=%d\n",
+		     ++dd->zns_debug_dispatch_seq,
+		     dd_zns_debug_zone_no(rq),
+		     (unsigned long long)blk_rq_pos(rq),
+		     blk_rq_sectors(rq),
+		     dd_zns_debug_hctx(rq),
+		     call_hctx->queue_num,
+		     dd_zns_req_is_multi_inflight(rq),
+		     from_dispatch_list,
+		     rq->internal_tag);
 }
 
 static void
@@ -722,7 +751,8 @@ deadline_next_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
  * read/write expire, fifo_batch, etc
  */
 static struct request *__dd_dispatch_request(struct deadline_data *dd,
-					     struct dd_per_prio *per_prio)
+					     struct dd_per_prio *per_prio,
+					     struct blk_mq_hw_ctx *call_hctx)
 {
 	struct request *rq, *next_rq;
 	enum dd_data_dir data_dir;
@@ -852,6 +882,7 @@ done:
 		blk_req_zone_write_lock(rq);
 	}
 	rq->rq_flags |= RQF_STARTED;
+	dd_zns_debug_log_dispatch(dd, rq, call_hctx, from_dispatch_list);
 	return rq;
 }
 
@@ -871,7 +902,7 @@ static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
 
 	spin_lock(&dd->lock);
 	for (prio = 0; prio <= DD_PRIO_MAX; prio++) {
-		rq = __dd_dispatch_request(dd, &dd->per_prio[prio]);
+		rq = __dd_dispatch_request(dd, &dd->per_prio[prio], hctx);
 		if (rq)
 			break;
 	}
