@@ -129,6 +129,7 @@ enum dd_zns_multi_inflight_result {
 	DD_ZNS_MULTI_INFLIGHT_NO_ZONE_STATE,
 	DD_ZNS_MULTI_INFLIGHT_ZONE_DISABLED,
 	DD_ZNS_MULTI_INFLIGHT_ZONE_WLOCKED,
+	DD_ZNS_MULTI_INFLIGHT_FOREIGN_HCTX,
 };
 
 /* Count one event of type 'event_type' and with I/O priority 'prio' */
@@ -214,6 +215,8 @@ dd_zns_multi_inflight_result_name(enum dd_zns_multi_inflight_result result)
 		return "zone_disabled";
 	case DD_ZNS_MULTI_INFLIGHT_ZONE_WLOCKED:
 		return "zone_wlocked";
+	case DD_ZNS_MULTI_INFLIGHT_FOREIGN_HCTX:
+		return "foreign_hctx";
 	default:
 		return "unknown";
 	}
@@ -385,7 +388,8 @@ dd_zns_req_is_multi_inflight_candidate(struct deadline_data *dd,
  * the stock ZWL path immediately before returning the request to blk-mq.
  */
 static bool dd_zns_can_dispatch(struct deadline_data *dd, struct request *rq,
-				bool allow_multi_inflight)
+				bool allow_multi_inflight,
+				struct blk_mq_hw_ctx *call_hctx)
 {
 	struct dd_zns_zone_state *zs;
 
@@ -403,6 +407,16 @@ static bool dd_zns_can_dispatch(struct deadline_data *dd, struct request *rq,
 	    !zs->disabled) {
 		if (blk_req_zone_is_write_locked(rq))
 			return false;
+		/*
+		 * Same-zone issue order survives only if a single dispatcher
+		 * pulls this zone's writes: the run context of the hctx the
+		 * request was allocated on. mq-deadline state is queue-global,
+		 * so a foreign hctx's run context may pull requests of this
+		 * zone into its private dispatch list, which is issued to the
+		 * hardware queue outside dd->lock and races the owner's list.
+		 */
+		if (call_hctx && rq->mq_hctx != call_hctx)
+			return false;
 		return true;
 	}
 
@@ -415,6 +429,7 @@ static bool dd_zns_can_dispatch(struct deadline_data *dd, struct request *rq,
 static bool
 dd_zns_try_start_multi_inflight(struct deadline_data *dd, struct request *rq,
 				bool from_dispatch_list,
+				struct blk_mq_hw_ctx *call_hctx,
 				enum dd_zns_multi_inflight_result *reason)
 {
 	enum dd_zns_multi_inflight_result result;
@@ -422,6 +437,17 @@ dd_zns_try_start_multi_inflight(struct deadline_data *dd, struct request *rq,
 
 	if (from_dispatch_list) {
 		*reason = DD_ZNS_MULTI_INFLIGHT_FROM_DISPATCH_LIST;
+		return false;
+	}
+
+	/*
+	 * Selection already rejects foreign pulls in dd_zns_can_dispatch()
+	 * within the same dd->lock critical section, and rq->mq_hctx never
+	 * changes after allocation, so this should be unreachable.
+	 */
+	if (call_hctx && rq->mq_hctx != call_hctx) {
+		WARN_ON_ONCE(1);
+		*reason = DD_ZNS_MULTI_INFLIGHT_FOREIGN_HCTX;
 		return false;
 	}
 
@@ -674,7 +700,8 @@ static struct request *deadline_skip_seq_writes(struct deadline_data *dd,
  */
 static struct request *
 deadline_fifo_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
-		      enum dd_data_dir data_dir)
+		      enum dd_data_dir data_dir,
+		      struct blk_mq_hw_ctx *call_hctx)
 {
 	struct request *rq;
 	unsigned long flags;
@@ -695,7 +722,7 @@ deadline_fifo_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
 	 */
 	spin_lock_irqsave(&dd->zone_lock, flags);
 	list_for_each_entry(rq, &per_prio->fifo_list[DD_WRITE], queuelist) {
-		if (dd_zns_can_dispatch(dd, rq, true) &&
+		if (dd_zns_can_dispatch(dd, rq, true, call_hctx) &&
 		    (blk_queue_nonrot(rq->q) ||
 		     !deadline_is_seq_write(dd, rq)))
 			goto out;
@@ -713,7 +740,8 @@ out:
  */
 static struct request *
 deadline_next_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
-		      enum dd_data_dir data_dir)
+		      enum dd_data_dir data_dir,
+		      struct blk_mq_hw_ctx *call_hctx)
 {
 	struct request *rq;
 	unsigned long flags;
@@ -734,7 +762,7 @@ deadline_next_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
 	 */
 	spin_lock_irqsave(&dd->zone_lock, flags);
 	while (rq) {
-		if (dd_zns_can_dispatch(dd, rq, true))
+		if (dd_zns_can_dispatch(dd, rq, true, call_hctx))
 			break;
 		if (blk_queue_nonrot(rq->q))
 			rq = deadline_latter_request(rq);
@@ -770,7 +798,7 @@ static struct request *__dd_dispatch_request(struct deadline_data *dd,
 				      queuelist);
 
 		spin_lock_irqsave(&dd->zone_lock, flags);
-		if (!dd_zns_can_dispatch(dd, rq, false)) {
+		if (!dd_zns_can_dispatch(dd, rq, false, call_hctx)) {
 			spin_unlock_irqrestore(&dd->zone_lock, flags);
 			return NULL;
 		}
@@ -784,7 +812,7 @@ static struct request *__dd_dispatch_request(struct deadline_data *dd,
 	/*
 	 * batches are currently reads XOR writes
 	 */
-	rq = deadline_next_request(dd, per_prio, dd->last_dir);
+	rq = deadline_next_request(dd, per_prio, dd->last_dir, call_hctx);
 	if (rq && dd->batching < dd->fifo_batch)
 		/* we have a next request are still entitled to batch */
 		goto dispatch_request;
@@ -797,7 +825,7 @@ static struct request *__dd_dispatch_request(struct deadline_data *dd,
 	if (!list_empty(&per_prio->fifo_list[DD_READ])) {
 		BUG_ON(RB_EMPTY_ROOT(&per_prio->sort_list[DD_READ]));
 
-		if (deadline_fifo_request(dd, per_prio, DD_WRITE) &&
+		if (deadline_fifo_request(dd, per_prio, DD_WRITE, call_hctx) &&
 		    (dd->starved++ >= dd->writes_starved))
 			goto dispatch_writes;
 
@@ -827,14 +855,14 @@ dispatch_find_request:
 	/*
 	 * we are not running a batch, find best request for selected data_dir
 	 */
-	next_rq = deadline_next_request(dd, per_prio, data_dir);
+	next_rq = deadline_next_request(dd, per_prio, data_dir, call_hctx);
 	if (deadline_check_fifo(per_prio, data_dir) || !next_rq) {
 		/*
 		 * A deadline has expired, the last request was in the other
 		 * direction, or we have run out of higher-sectored requests.
 		 * Start again from the request with the earliest expiry time.
 		 */
-		rq = deadline_fifo_request(dd, per_prio, data_dir);
+		rq = deadline_fifo_request(dd, per_prio, data_dir, call_hctx);
 	} else {
 		/*
 		 * The last req was the same dir and we have a next request in
@@ -873,7 +901,7 @@ done:
 		spin_lock_irqsave(&dd->zone_lock, flags);
 		if (!dd_zns_try_start_multi_inflight(dd, rq,
 						     from_dispatch_list,
-						     &zns_result))
+						     call_hctx, &zns_result))
 			dd_zns_fallback_zone_write_lock(dd, rq,
 							from_dispatch_list,
 							zns_result);
