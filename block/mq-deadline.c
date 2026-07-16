@@ -440,20 +440,30 @@ dd_zns_try_start_multi_inflight(struct deadline_data *dd, struct request *rq,
 		return false;
 	}
 
-	/*
-	 * Selection already rejects foreign pulls in dd_zns_can_dispatch()
-	 * within the same dd->lock critical section, and rq->mq_hctx never
-	 * changes after allocation, so this should be unreachable.
-	 */
-	if (call_hctx && rq->mq_hctx != call_hctx) {
-		WARN_ON_ONCE(1);
-		*reason = DD_ZNS_MULTI_INFLIGHT_FOREIGN_HCTX;
-		return false;
-	}
-
 	result = dd_zns_req_multi_inflight_candidate_result(dd, rq);
 	if (result != DD_ZNS_MULTI_INFLIGHT_OK) {
 		*reason = result;
+		return false;
+	}
+
+	/*
+	 * Selection rejects foreign pulls of multi-inflight candidates in
+	 * dd_zns_can_dispatch() within the same dd->lock critical section,
+	 * and rq->mq_hctx never changes after allocation. Reaching here with
+	 * a foreign call_hctx therefore means the own-hctx gate was bypassed
+	 * for a candidate write: a real same-zone ordering hazard. Reads and
+	 * non-candidate requests legitimately reach this function from a
+	 * foreign run context (mq-deadline state is queue-global), which is
+	 * why this check must come after the candidate check above.
+	 */
+	if (call_hctx && rq->mq_hctx != call_hctx) {
+		pr_warn_ratelimited("mq-deadline: zns foreign candidate pull dev=%s zone=%u pos=%llu rq_hctx=%u call_hctx=%u itag=%d\n",
+				    rq->rq_disk ? rq->rq_disk->disk_name : "?",
+				    dd_zns_debug_zone_no(rq),
+				    (unsigned long long)blk_rq_pos(rq),
+				    dd_zns_debug_hctx(rq),
+				    call_hctx->queue_num, rq->internal_tag);
+		*reason = DD_ZNS_MULTI_INFLIGHT_FOREIGN_HCTX;
 		return false;
 	}
 
