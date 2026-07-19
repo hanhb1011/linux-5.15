@@ -165,6 +165,8 @@ struct blk_mq_alloc_data {
 	struct blk_mq_hw_ctx *hctx;
 };
 
+bool blk_mq_zns_apply_per_zone_mapping(struct blk_mq_alloc_data *data);
+
 static inline bool blk_mq_is_sbitmap_shared(unsigned int flags)
 {
 	return flags & BLK_MQ_F_TAG_HCTX_SHARED;

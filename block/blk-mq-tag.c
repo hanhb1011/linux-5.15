@@ -145,9 +145,30 @@ unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
 
 		sbitmap_finish_wait(bt, ws, &wait);
 
-		data->ctx = blk_mq_get_ctx(data->q);
-		data->hctx = blk_mq_map_queue(data->q, data->cmd_flags,
-						data->ctx);
+		/*
+		 * Remapping to the current CPU's hctx here would silently
+		 * discard a ZNS per-zone forced hctx and break the
+		 * same-zone -> same-hctx invariant for exactly the requests
+		 * that slept on tag exhaustion. Re-apply the forced mapping
+		 * first; it validates the target hctx and falls back to the
+		 * CPU-based mapping (with a debug log) if it is not usable.
+		 */
+		if (blk_mq_zns_apply_per_zone_mapping(data)) {
+			/*
+			 * TEMPORARY instrumentation: each hit is a write that
+			 * slept on tag exhaustion and would have been
+			 * misrouted to the current CPU's hctx without the
+			 * re-apply above. Remove after validation.
+			 */
+			trace_printk("zns_map tag_wait_reapply zone=%u hctx=%u\n",
+				     data->zns_per_zone_mapping_zone_no,
+				     data->zns_per_zone_mapping_hctx_idx);
+		} else {
+			data->ctx = blk_mq_get_ctx(data->q);
+			data->hctx = blk_mq_map_queue(data->q,
+						      data->cmd_flags,
+						      data->ctx);
+		}
 		tags = blk_mq_tags_from_data(data);
 		if (data->flags & BLK_MQ_REQ_RESERVED)
 			bt = tags->breserved_tags;

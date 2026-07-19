@@ -416,7 +416,7 @@ fallback:
 #endif
 }
 
-static bool blk_mq_zns_apply_per_zone_mapping(struct blk_mq_alloc_data *data)
+bool blk_mq_zns_apply_per_zone_mapping(struct blk_mq_alloc_data *data)
 {
 	struct request_queue *q = data->q;
 	const char *reason;
